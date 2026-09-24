@@ -1,4 +1,4 @@
-iqoptionapi
+git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
 python-telegram-bot
 python-dotenv
 pandas
