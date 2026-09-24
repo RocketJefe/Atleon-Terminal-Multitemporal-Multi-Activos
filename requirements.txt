@@ -1,0 +1,4 @@
+iqoptionapi
+python-telegram-bot
+python-dotenv
+pandas
