@@ -80,49 +80,53 @@ def asegurar_conexion():
     except Exception:
         return conectar_broker()
 
-# ================= 4. DETECCIÓN DINÁMICA DE ACTIVOS VIVOS =================
-ALIAS_MAP = {
-    "PEPE": "PEPEUSD-OTC", "TRUMP": "TRUMPUSD-OTC", "LUNA": "LUNAUSD-OTC",
-    "BTC": "BTCUSD-OTC", "BITCOIN": "BTCUSD-OTC", "DOGE": "DOGEUSD-OTC",
-    "NIKE": "NKE-OTC", "NKE": "NKE-OTC", "TESLA": "TSLA-OTC", "TSLA": "TSLA-OTC",
-    "APPLE": "AAPL-OTC", "AAPL": "AAPL-OTC", "COCACOLA": "KO-OTC", "KO": "KO-OTC",
-    "ORO": "XAUUSD-OTC", "GOLD": "XAUUSD-OTC"
-}
-
-def obtener_activos_vivos_ahora():
-    """Extrae únicamente los activos que IQ Option tiene abiertos y con liquidez en este instante."""
+# ================= 4. EXTRACTOR DE VELAS BLINDADO =================
+def obtener_velas_puras(par, intervalo=60, cantidad=4):
+    """
+    Extrae velas usando el diccionario en tiempo real o fallback
+    limpiando nombres front. y evitando caídas del websocket.
+    """
+    global API
     if not asegurar_conexion():
-        return []
+        return None
 
-    abiertos = []
+    # Normalizar nombre según el catálogo de IQ Option
+    activo = par.strip()
+    
+    # 1. Intentar vía suscripción de stream rápido
     try:
-        init_data = API.get_all_init()
-        turbo = init_data.get("result", {}).get("turbo", {}).get("actives", {})
-        binary = init_data.get("result", {}).get("binary", {}).get("actives", {})
-
-        for data in [turbo, binary]:
-            for _, info in data.items():
-                if info.get("enabled", False) and not info.get("is_suspended", True):
-                    raw = info.get("name", "").replace("front.", "").replace("/", "").strip()
-                    if raw and raw not in abiertos:
-                        abiertos.append(raw)
+        API.start_candles_stream(activo, intervalo, cantidad)
+        for _ in range(5):
+            time.sleep(0.15)
+            velas_dict = API.get_realtime_candles(activo, intervalo)
+            if velas_dict and isinstance(velas_dict, dict) and len(velas_dict) >= 3:
+                API.stop_candles_stream(activo, intervalo)
+                lista = list(velas_dict.values())
+                lista.sort(key=lambda x: x.get("from", 0))
+                return lista
+        API.stop_candles_stream(activo, intervalo)
     except Exception:
         pass
 
-    if not abiertos:
-        # Respaldo confiable si get_all_init no devuelve datos temporales
-        abiertos = ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "EURJPY-OTC", "XAUUSD-OTC"]
-
-    return abiertos
-
-def _analizar_par_rapido(par):
-    global API
+    # 2. Intentar vía llamada directa con nombre nativo
     try:
-        # Se solicitan solo 3 velas con timeout instantáneo
-        velas = API.get_candles(par, 60, 3, int(time.time()))
-        if not velas or not isinstance(velas, list) or len(velas) < 3:
-            return None
+        candidatos_nombre = [activo, f"front.{activo}", activo.replace("front.", "")]
+        ahora = int(time.time())
+        for cand in candidatos_nombre:
+            velas = API.get_candles(cand, intervalo, cantidad, ahora)
+            if velas and isinstance(velas, list) and len(velas) >= 3 and "close" in velas[-1]:
+                return velas
+    except Exception:
+        pass
 
+    return None
+
+def analizar_par_limpio(par):
+    velas = obtener_velas_puras(par, 60, 4)
+    if not velas or len(velas) < 3:
+        return None
+
+    try:
         c_act = float(velas[-1]["close"])
         c_prev = float(velas[-2]["close"])
         o_act = float(velas[-1]["open"])
@@ -141,16 +145,40 @@ def _analizar_par_rapido(par):
         pass
     return None
 
-async def analizar_par_seguro(par):
+async def evaluar_par_seguro(par):
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_analizar_par_rapido, par),
-            timeout=1.2
+            asyncio.to_thread(analizar_par_limpio, par),
+            timeout=2.0
         )
     except Exception:
         return None
 
-# ================= 5. CONTROLADORES TELEGRAM =================
+# ================= 5. CATÁLOGO DINÁMICO =================
+def listar_activos_reales():
+    if not asegurar_conexion():
+        return []
+
+    activos = []
+    try:
+        init_data = API.get_all_init()
+        turbo = init_data.get("result", {}).get("turbo", {}).get("actives", {})
+        binary = init_data.get("result", {}).get("binary", {}).get("actives", {})
+
+        for conjunto in [turbo, binary]:
+            for _, info in conjunto.items():
+                if info.get("enabled", False) and not info.get("is_suspended", True):
+                    nombre = info.get("name", "").replace("front.", "").strip()
+                    if nombre and nombre not in activos:
+                        activos.append(nombre)
+    except Exception:
+        pass
+
+    if not activos:
+        activos = ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "EURJPY-OTC", "LUNA-OTC"]
+    return activos
+
+# ================= 6. CONTROLADORES TELEGRAM =================
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conectado = asegurar_conexion()
     saldo = f"${API.get_balance():.2f}" if conectado and API else "$0.00"
@@ -161,34 +189,30 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Broker: {'🟢 Conectado' if conectado else '🔴 Desconectado'}\n"
         f"• Saldo: {saldo}\n"
         f"• Canal Destino: {canal_info}\n"
-        f"• Motor: Detección dinámica en vivo (Forex, Crypto, Stocks)"
+        f"• Motor: Stream + Fallback de Velas Activo"
     )
 
 async def activos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🔍 Consultando activos vivos en el broker...")
-    vivos = obtener_activos_vivos_ahora()
-    if vivos:
-        resumen = ", ".join(vivos[:25])
-        await msg.edit_text(f"⚡ **Activos Abiertos Ahora ({len(vivos)}):**\n\n`{resumen}`")
+    msg = await update.message.reply_text("🔍 Obteniendo catálogo abierto...")
+    activos = listar_activos_reales()
+    if activos:
+        muestra = ", ".join(activos[:25])
+        await msg.edit_text(f"⚡ **Activos Abiertos ({len(activos)}):**\n\n`{muestra}`")
     else:
-        await msg.edit_text("⚠️ No se pudieron obtener los activos abiertos en este momento.")
+        await msg.edit_text("⚠️ No se pudieron obtener los activos.")
 
 async def analizar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Uso: `/analizar EURUSD-OTC` o `/analizar PEPE`")
+        await update.message.reply_text("Uso: `/analizar LUNA-OTC` o `/analizar EURUSD-OTC`")
         return
 
-    entrada = context.args[0].upper().replace("/", "").strip()
-    par = ALIAS_MAP.get(entrada, entrada)
-    if "-OTC" not in par and not any(k in par for k in ["USD", "EUR", "GBP", "JPY"]):
-        par = f"{par}-OTC"
-
+    par = context.args[0].upper().replace("/", "").strip()
     if not asegurar_conexion():
         await update.message.reply_text("❌ Sin conexión con el broker.")
         return
 
     msg = await update.message.reply_text(f"🔍 Evaluando `{par}`...")
-    res = await analizar_par_seguro(par)
+    res = await evaluar_par_seguro(par)
 
     if res:
         texto = (
@@ -196,25 +220,23 @@ async def analizar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Señal: **{res['direccion']}**\n"
             f"• Precio: `{res['precio']}`\n"
             f"• Detalle: {res['detalle']}\n\n"
-            f"Disparo sugerido: `{res['activo']} {res['direccion']}`"
+            f"Comando: `{res['activo']} {res['direccion']}`"
         )
         await msg.edit_text(texto)
     else:
-        await msg.edit_text(f"⚪ `{par}` mercado cerrado o sin liquidez suficiente en este segundo.")
+        await msg.edit_text(f"⚪ `{par}` sin datos de velas en este segundo o mercado cerrado.")
 
 async def escanear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not asegurar_conexion():
         await update.message.reply_text("❌ Sin conexión con el broker.")
         return
 
-    msg = await update.message.reply_text("🛰️ Escaneando los activos activos de mayor liquidez...")
-    
-    # Tomamos los activos que el broker reporta abiertos
-    candidatos = obtener_activos_vivos_ahora()[:8]  # Limite de 8 para responder en <4 segundos
+    msg = await update.message.reply_text("🛰️ Escaneando activos con liquidez...")
+    activos = listar_activos_reales()[:6]
 
     senales = []
-    for par in candidatos:
-        res = await analizar_par_seguro(par)
+    for par in activos:
+        res = await evaluar_par_seguro(par)
         if res:
             senales.append(res)
             if EXECUTOR_CHAT_ID:
@@ -230,14 +252,13 @@ async def escanear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lineas = [f"🎯 `{s['activo']}` ➔ **{s['direccion']}**" for s in senales]
         await msg.edit_text("⚡ **Señales Detectadas y Despachadas:**\n\n" + "\n".join(lineas))
     else:
-        await msg.edit_text("⚪ Sin señales técnicas en este instante en los activos abiertos. Reintenta en 30s.")
+        await msg.edit_text("⚪ Sin señales técnicas en este instante. Reintenta en 30s.")
 
-# ================= 6. ARRANQUE CON TIMEOUTS AMPLIADOS =================
+# ================= 7. ARRANQUE =================
 if __name__ == "__main__":
     Thread(target=run_web_server, daemon=True).start()
     conectar_broker()
 
-    # Construcción de la aplicación con timeouts extendidos para evitar 'TimedOut'
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
