@@ -21,14 +21,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BROKER_EMAIL = os.getenv("BROKER_EMAIL")
 BROKER_PASSWORD = os.getenv("BROKER_PASSWORD")
 BROKER_PLATFORM = os.getenv("BROKER_PLATFORM", "IQOPTION").upper()
-EXECUTOR_CHAT_ID = os.getenv("EXECUTOR_CHAT_ID")  # Ej: -100xxxxxxxxxx
+EXECUTOR_CHAT_ID = os.getenv("EXECUTOR_CHAT_ID")  # Ej: -1003994540922
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-# Silenciar los logs internos ruidosos de la librería
+# Silenciar mensajes verbosos de la librería
 logging.getLogger("iqoptionapi").setLevel(logging.CRITICAL)
 
 # ================= 2. SERVIDOR KEEPALIVE HTTP =================
@@ -37,7 +37,7 @@ class RenderKeepAliveHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Atleon Terminal Live")
+        self.wfile.write(b"Atleon Terminal Multitemporal Live")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -82,17 +82,50 @@ def asegurar_conexion():
     except Exception:
         return conectar_broker()
 
-# ================= 4. ANÁLISIS AISLADO SIN BLOQUEOS =================
-# Pares seguros con cotización 24/7 continua
+# ================= 4. CATÁLOGO MAESTRO MULTI-ACTIVOS =================
 PARES_ROBUSTOS = [
-    "EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", 
-    "EURJPY-OTC", "XAUUSD-OTC", "AUDCAD-OTC"
+    # --- FOREX Y COMMODITIES OTC ---
+    "EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "EURJPY-OTC", "XAUUSD-OTC", "AUDCAD-OTC",
+
+    # --- CRYPTO & MEMES OTC ---
+    "PEPEUSD-OTC", "TRUMPUSD-OTC", "LUNAUSD-OTC", "BTCUSD-OTC", "DOGEUSD-OTC",
+
+    # --- ACCIONES GLOBALES OTC (Tickers Wall Street) ---
+    "TSLA-OTC",   # Tesla
+    "NKE-OTC",    # Nike
+    "KO-OTC",     # Coca-Cola
+    "AAPL-OTC",   # Apple
+    "AMZN-OTC",   # Amazon
+    "NVDA-OTC"    # Nvidia
 ]
+
+ALIAS_ACTIVOS = {
+    "PEPE": "PEPEUSD-OTC",
+    "TRUMP": "TRUMPUSD-OTC",
+    "LUNA": "LUNAUSD-OTC",
+    "BITCOIN": "BTCUSD-OTC",
+    "BTC": "BTCUSD-OTC",
+    "DOGE": "DOGEUSD-OTC",
+    "TESLA": "TSLA-OTC",
+    "TSLA": "TSLA-OTC",
+    "NIKE": "NKE-OTC",
+    "NKE": "NKE-OTC",
+    "COCACOLA": "KO-OTC",
+    "COCA-COLA": "KO-OTC",
+    "KO": "KO-OTC",
+    "APPLE": "AAPL-OTC",
+    "AAPL": "AAPL-OTC",
+    "AMAZON": "AMZN-OTC",
+    "AMZN": "AMZN-OTC",
+    "NVIDIA": "NVDA-OTC",
+    "NVDA": "NVDA-OTC",
+    "ORO": "XAUUSD-OTC",
+    "GOLD": "XAUUSD-OTC"
+}
 
 def _analizar_par_seguro(par):
     global API
     try:
-        # Se solicita 1 minuto con timestamp actual redondeado
         velas = API.get_candles(par, 60, 4, int(time.time()))
         if not velas or not isinstance(velas, list) or len(velas) < 3:
             return None
@@ -102,7 +135,6 @@ def _analizar_par_seguro(par):
         c_prev = float(df.iloc[-2]["close"])
         o_act = float(df.iloc[-1]["open"])
 
-        # Tendencia e impulso
         tendencia = "CALL" if c_act > c_prev else ("PUT" if c_act < c_prev else None)
         impulso = "CALL" if c_act > o_act else ("PUT" if c_act < o_act else None)
 
@@ -119,7 +151,6 @@ def _analizar_par_seguro(par):
 
 async def analizar_par_con_timeout(par):
     try:
-        # Si el broker no responde este par en 1.5s, se cancela y no congela el bot
         return await asyncio.wait_for(
             asyncio.to_thread(_analizar_par_seguro, par),
             timeout=1.5
@@ -134,24 +165,28 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     canal_info = f"`{EXECUTOR_CHAT_ID}`" if EXECUTOR_CHAT_ID else "⚠️ No configurado"
     
     await update.message.reply_text(
-        f"📊 **Atleon Terminal - Estado**\n"
+        f"📊 **Atleon Terminal - Multi-Activos**\n"
         f"• Broker: {'🟢 Conectado' if conectado else '🔴 Desconectado'}\n"
         f"• Saldo: {saldo}\n"
         f"• Canal Destino: {canal_info}\n"
-        f"• Pares Activos: {len(PARES_ROBUSTOS)} pares OTC blindados"
+        f"• Catálogo: Forex, Oro, Cripto (Pepe, Luna, Trump) y Acciones (Nike, Tesla, Coca-Cola)"
     )
 
 async def analizar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Uso: `/analizar EURUSD-OTC`")
+        await update.message.reply_text("Uso: `/analizar PEPE`, `/analizar NIKE`, `/analizar TESLA`, `/analizar EURUSD-OTC`")
         return
 
-    par = context.args[0].upper().replace("/", "").strip()
+    entrada = context.args[0].upper().replace("/", "").strip()
+    par = ALIAS_ACTIVOS.get(entrada, entrada)
+    if not "-OTC" in par and not any(f in par for f in ["USD", "EUR", "GBP"]):
+        par = f"{par}-OTC"
+
     if not asegurar_conexion():
         await update.message.reply_text("❌ Error de conexión con el broker.")
         return
 
-    msg = await update.message.reply_text(f"🔍 Analizando `{par}`...")
+    msg = await update.message.reply_text(f"🔍 Analizando `{par}` ({entrada})...")
     res = await analizar_par_con_timeout(par)
 
     if res:
@@ -164,21 +199,20 @@ async def analizar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await msg.edit_text(texto)
     else:
-        await msg.edit_text(f"⚪ `{par}` sin confirmación técnica en este segundo.")
+        await msg.edit_text(f"⚪ `{par}` mercado cerrado o sin liquidez de velas en este segundo.")
 
 async def escanear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not asegurar_conexion():
         await update.message.reply_text("❌ Sin conexión con el broker.")
         return
 
-    msg = await update.message.reply_text("🛰️ Escaneando pares en paralelo...")
+    msg = await update.message.reply_text("🛰️ Escaneando multi-activos (Forex, Cripto y Acciones)...")
     senales = []
 
     for par in PARES_ROBUSTOS:
         res = await analizar_par_con_timeout(par)
         if res:
             senales.append(res)
-            # Despacho directo al Canal / Ejecutor
             if EXECUTOR_CHAT_ID:
                 try:
                     await context.bot.send_message(
@@ -193,7 +227,7 @@ async def escanear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resultado = "⚡ **Señales Detectadas y Despachadas:**\n\n" + "\n".join(lineas)
         await msg.edit_text(resultado)
     else:
-        await msg.edit_text("⚪ Sin señales de confluencia en este instante. Reintenta en 30s.")
+        await msg.edit_text("⚪ Sin señales claras en este instante. Reintenta en unos segundos.")
 
 # ================= 6. ARRANQUE =================
 if __name__ == "__main__":
